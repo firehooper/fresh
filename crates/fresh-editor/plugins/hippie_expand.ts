@@ -16,6 +16,9 @@
  * Keybinding: user must bind Alt+/ to "hippie_expand_next" in config.
  * Once cycling begins, the plugin enters "hippie-cycling" mode which
  * captures Alt+/, Alt+Shift+/, and Escape. Any cursor movement exits.
+ *
+ * Cross-platform: path handling normalizes separators via editor.pathJoin()
+ * which always uses forward slashes. Both / and \ are recognized in input.
  */
 
 const editor = getEditor();
@@ -30,8 +33,15 @@ const BUFFER_READ_LIMIT = 500 * 1024; // 500KB
 /** Maximum candidates to collect before stopping (perf guard) */
 const MAX_CANDIDATES = 50;
 
-/** Regex character class for "word" characters */
+/** Regex character class for "word" characters (identifiers) */
 const WORD_CHAR_PATTERN = /[A-Za-z0-9_\-]/;
+
+/**
+ * Regex character class for "path" characters.
+ * Includes word chars plus separators, dots, tildes, colons (Windows drive).
+ * Used only for the path-aware prefix extraction.
+ */
+const PATH_CHAR_PATTERN = /[A-Za-z0-9_\-./\\~:]/;
 
 /** Regex for extracting word tokens from buffer text.
  *  Minimum length is set dynamically based on prefix length. */
@@ -68,6 +78,39 @@ function makeIdleState(): HippieState {
 
 let state: HippieState = makeIdleState();
 
+/**
+ * Guard flag: suppresses cursor_moved checks while we are programmatically
+ * editing the buffer in applyExpansion(). Without this, the deleteRange +
+ * insertText + setBufferCursor calls can fire cursor_moved events that
+ * prematurely exit cycling mode.
+ */
+let suppressCursorCheck = false;
+
+// ---------------------------------------------------------------------------
+// Cross-platform path utilities
+// ---------------------------------------------------------------------------
+
+/** Normalize path separators to forward slashes for consistent comparison. */
+function normalizeSeparators(path: string): string {
+  return path.replace(/\\/g, "/");
+}
+
+/**
+ * Case-insensitive path comparison on Windows, case-sensitive on Linux/macOS.
+ * Uses a simple heuristic: if either path contains a drive letter (C:),
+ * assume Windows and compare case-insensitively.
+ */
+function pathsEqual(a: string, b: string): boolean {
+  const aNorm = normalizeSeparators(a);
+  const bNorm = normalizeSeparators(b);
+  // Heuristic: drive letter pattern like "C:/" indicates Windows
+  const isWindows = /^[A-Za-z]:\//.test(aNorm) || /^[A-Za-z]:\//.test(bNorm);
+  if (isWindows) {
+    return aNorm.toLowerCase() === bNorm.toLowerCase();
+  }
+  return aNorm === bNorm;
+}
+
 // ---------------------------------------------------------------------------
 // §6.1  Word Prefix Extraction
 // ---------------------------------------------------------------------------
@@ -86,6 +129,26 @@ function extractWordPrefix(
 ): { prefix: string; start: number } {
   let start = cursorPos;
   while (start > 0 && WORD_CHAR_PATTERN.test(bufferText[start - 1])) {
+    start--;
+  }
+  const prefix = bufferText.slice(start, cursorPos);
+  return { prefix, start };
+}
+
+/**
+ * Walk backwards from `cursorPos` collecting path-like characters.
+ * Includes /, \, ., ~, : (Windows drive letters) in addition to word chars.
+ * Used when we suspect the user is typing a file path.
+ *
+ * This is a separate extraction because path chars (slashes, dots) would
+ * break normal word completion if included in the default pattern.
+ */
+function extractPathPrefix(
+  bufferText: string,
+  cursorPos: number,
+): { prefix: string; start: number } {
+  let start = cursorPos;
+  while (start > 0 && PATH_CHAR_PATTERN.test(bufferText[start - 1])) {
     start--;
   }
   const prefix = bufferText.slice(start, cursorPos);
@@ -155,6 +218,7 @@ function collectBufferWords(
     case "before": return beforeCursor;
     case "after":  return afterCursor;
     case "both":   return [...beforeCursor, ...afterCursor];
+    default:       return [];
   }
 }
 
@@ -194,6 +258,7 @@ function collectFirstWords(
     case "before": return before;
     case "after":  return after;
     case "both":   return [...before, ...after];
+    default:       return [];
   }
 }
 
@@ -204,12 +269,18 @@ function collectFirstWords(
 /**
  * Collect candidates from all sources in priority order.
  * Stops early once MAX_CANDIDATES are found (perf guard for many open buffers).
+ *
+ * If the word prefix looks path-like (contains /, \, starts with . or ~),
+ * we use extractPathPrefix for a wider capture and skip word sources.
+ * Otherwise we collect word candidates from buffers normally.
  */
 async function collectAllCandidates(
   prefix: string,
+  prefixStart: number,
   activeBufferId: number,
   cursorPos: number,
-): Promise<string[]> {
+  bufferText: string,
+): Promise<{ candidates: string[]; usedPrefix: string; usedStart: number }> {
   const allCandidates: string[] = [];
   const seenLower = new Set<string>();
 
@@ -227,15 +298,31 @@ async function collectAllCandidates(
     }
   }
 
-  // --- Source 1 & 2: Current buffer (before then after cursor) ---
-  const currentText = await readBufferCapped(activeBufferId);
-  if (currentText !== null) {
-    const beforeWords = collectBufferWords(currentText, prefix, cursorPos, "before");
-    appendUnique(beforeWords);
+  // Check if the broader path-prefix context looks path-like.
+  // We do this by re-extracting with path chars and checking the result.
+  const pathExtraction = extractPathPrefix(bufferText, cursorPos);
+  const isPathContext = looksLikePath(pathExtraction.prefix);
 
-    const afterWords = collectBufferWords(currentText, prefix, cursorPos, "after");
-    appendUnique(afterWords);
+  if (isPathContext) {
+    // --- Source 4 first: File path completions ---
+    // Use the wider path-prefix (includes /, \, ., ~, :)
+    const pathCandidates = collectPathCandidates(pathExtraction.prefix);
+    appendUnique(pathCandidates);
+
+    // Return the path prefix info so applyExpansion replaces the right region
+    return {
+      candidates: allCandidates,
+      usedPrefix: pathExtraction.prefix,
+      usedStart: pathExtraction.start,
+    };
   }
+
+  // --- Source 1 & 2: Current buffer (before then after cursor) ---
+  const beforeWords = collectBufferWords(bufferText, prefix, cursorPos, "before");
+  appendUnique(beforeWords);
+
+  const afterWords = collectBufferWords(bufferText, prefix, cursorPos, "after");
+  appendUnique(afterWords);
 
   // --- Source 3: Other open (non-virtual) buffers ---
   if (allCandidates.length < MAX_CANDIDATES) {
@@ -258,13 +345,11 @@ async function collectAllCandidates(
     }
   }
 
-  // --- Source 4: File path completions (if prefix looks path-like) ---
-  if (allCandidates.length < MAX_CANDIDATES && looksLikePath(prefix)) {
-    const pathCandidates = collectPathCandidates(prefix);
-    appendUnique(pathCandidates);
-  }
-
-  return allCandidates;
+  return {
+    candidates: allCandidates,
+    usedPrefix: prefix,
+    usedStart: prefixStart,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -292,17 +377,26 @@ async function readBufferCapped(bufferId: number): Promise<string | null> {
 
 /**
  * Heuristic: does this prefix look like a filesystem path?
- * Triggers when it contains `/`, or starts with `.`, `~`, or `/`.
+ * Triggers when it contains a separator, or starts with ., ~, or /.
  */
 function looksLikePath(prefix: string): boolean {
   if (prefix.length === 0) {
     return false;
   }
+  // Contains a path separator
   if (prefix.includes("/") || prefix.includes("\\")) {
     return true;
   }
+  // Starts with path-like char
   const firstChar = prefix[0];
-  return firstChar === "." || firstChar === "~" || firstChar === "/";
+  if (firstChar === "." || firstChar === "~" || firstChar === "/") {
+    return true;
+  }
+  // Windows drive letter (e.g., "C:" or "C:\")
+  if (prefix.length >= 2 && /^[A-Za-z]:/.test(prefix)) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -310,7 +404,7 @@ function looksLikePath(prefix: string): boolean {
  * Reuses the same parsing approach as path_complete.ts.
  */
 function collectPathCandidates(prefix: string): string[] {
-  const { dir, pattern } = parsePathPrefix(prefix);
+  const { dir, pattern, inputDir } = parsePathPrefix(prefix);
   const entries = editor.readDir(dir);
   if (!entries) {
     return [];
@@ -327,7 +421,9 @@ function collectPathCandidates(prefix: string): string[] {
 
     if (entry.name.toLowerCase().startsWith(patternLower)) {
       const suffix = entry.is_dir ? "/" : "";
-      const fullPath = buildFullPath(dir, entry.name) + suffix;
+      // Reconstruct the path using the user's original dir prefix
+      // so the inserted text matches what they typed (relative vs absolute)
+      const fullPath = rebuildUserPath(inputDir, entry.name) + suffix;
       results.push(fullPath);
     }
 
@@ -341,38 +437,46 @@ function collectPathCandidates(prefix: string): string[] {
 
 /**
  * Parse a path prefix into its directory and trailing pattern components.
- * Similar to path_complete.ts parsePath but works with word-prefix context.
+ * Returns:
+ *   - dir: resolved absolute directory for readDir()
+ *   - pattern: trailing filename fragment to match against
+ *   - inputDir: the directory portion as the user typed it (for reconstruction)
+ *
+ * Handles both / and \ separators for cross-platform support.
  */
-function parsePathPrefix(input: string): { dir: string; pattern: string } {
+function parsePathPrefix(
+  input: string,
+): { dir: string; pattern: string; inputDir: string } {
   const lastSlash = Math.max(input.lastIndexOf("/"), input.lastIndexOf("\\"));
 
   if (lastSlash === -1) {
     // No slash — treat prefix as pattern in cwd
-    return { dir: editor.getCwd(), pattern: input };
+    return { dir: editor.getCwd(), pattern: input, inputDir: "" };
   }
 
-  const dir = input.slice(0, lastSlash) || "/";
+  const inputDir = input.slice(0, lastSlash + 1); // include the trailing slash
   const pattern = input.slice(lastSlash + 1);
+  const dirPath = input.slice(0, lastSlash) || "/";
 
   // Resolve relative paths against cwd
-  if (!editor.pathIsAbsolute(dir)) {
-    return { dir: editor.pathJoin(editor.getCwd(), dir), pattern };
+  if (!editor.pathIsAbsolute(dirPath)) {
+    const resolved = editor.pathJoin(editor.getCwd(), dirPath);
+    return { dir: resolved, pattern, inputDir };
   }
 
-  return { dir, pattern };
+  return { dir: dirPath, pattern, inputDir };
 }
 
-/** Build a display path from dir + filename, keeping it relative when possible. */
-function buildFullPath(dir: string, name: string): string {
-  const cwd = editor.getCwd();
-  const absolute = editor.pathJoin(dir, name);
-
-  // If the dir was cwd, return just the name
-  if (dir === cwd || dir === ".") {
+/**
+ * Rebuild the display path using the user's original directory prefix.
+ * This preserves their style (relative vs absolute, / vs \).
+ */
+function rebuildUserPath(inputDir: string, name: string): string {
+  // If inputDir is empty, the user didn't type a directory — just return the name
+  if (inputDir === "") {
     return name;
   }
-
-  return absolute;
+  return inputDir + name;
 }
 
 // ---------------------------------------------------------------------------
@@ -383,9 +487,13 @@ function buildFullPath(dir: string, name: string): string {
  * Replace the current prefix/completion region with the given candidate.
  * The region is [state.prefixStart .. state.prefixStart + lastInserted.length].
  *
+ * Sets suppressCursorCheck to avoid the cursor_moved handler exiting
+ * cycling mode during our own programmatic edits.
+ *
  * If any editor mutation fails, we exit cycling mode to avoid state corruption.
  */
 function applyExpansion(candidate: string): void {
+  suppressCursorCheck = true;
   try {
     const bufferId = editor.getActiveBufferId();
     const deleteEnd = state.prefixStart + editor.utf8ByteLength(state.lastInserted);
@@ -401,6 +509,8 @@ function applyExpansion(candidate: string): void {
   } catch {
     editor.setStatus(editor.t("status.error"));
     exitCyclingMode();
+  } finally {
+    suppressCursorCheck = false;
   }
 }
 
@@ -534,6 +644,11 @@ registerHandler("hippie_expand_abort", hippie_expand_abort);
 /**
  * Start a new expansion: extract prefix, collect candidates, insert first.
  * If no candidates found, show a status message and do nothing.
+ *
+ * Performs two-phase prefix extraction:
+ *   1. Standard word prefix (for buffer word sources)
+ *   2. Extended path prefix (for filesystem source, includes / \ . ~ :)
+ * collectAllCandidates decides which prefix to use based on context.
  */
 async function startExpansion(): Promise<void> {
   const bufferId = editor.getActiveBufferId();
@@ -547,26 +662,30 @@ async function startExpansion(): Promise<void> {
 
   const { prefix, start } = extractWordPrefix(bufferText, cursorPos);
 
-  const candidates = await collectAllCandidates(prefix, bufferId, cursorPos);
+  const result = await collectAllCandidates(
+    prefix, start, bufferId, cursorPos, bufferText,
+  );
 
-  if (candidates.length === 0) {
+  if (result.candidates.length === 0) {
     editor.setStatus(editor.t("status.no_candidates"));
     return;
   }
 
-  // Initialize cycling state
+  // Initialize cycling state.
+  // Use the prefix/start that collectAllCandidates actually matched against,
+  // which may be the wider path prefix if we're in a path context.
   state = {
     active: true,
-    prefix: prefix,
-    prefixStart: start,
-    candidates: candidates,
+    prefix: result.usedPrefix,
+    prefixStart: result.usedStart,
+    candidates: result.candidates,
     index: 0,
-    lastInserted: prefix, // currently the prefix is in the buffer
+    lastInserted: result.usedPrefix, // currently in the buffer
     previousMode: null,
   };
 
   // Insert first candidate
-  applyExpansion(candidates[0]);
+  applyExpansion(result.candidates[0]);
   enterCyclingMode();
   showCyclingStatus();
 }
@@ -578,8 +697,14 @@ async function startExpansion(): Promise<void> {
 /**
  * When the user moves the cursor to an unexpected position while cycling,
  * commit the current expansion and exit cycling mode.
+ *
+ * Guarded by suppressCursorCheck so our own programmatic edits in
+ * applyExpansion() don't trigger a premature exit.
  */
 function hippie_on_cursor_moved(): void {
+  if (suppressCursorCheck) {
+    return;
+  }
   if (!state.active) {
     return;
   }

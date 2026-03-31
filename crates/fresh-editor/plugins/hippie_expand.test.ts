@@ -1,11 +1,11 @@
 /**
  * Unit tests for hippie_expand.ts pure functions.
  *
- * These tests exercise extractWordPrefix, collectBufferWords, looksLikePath,
- * and parsePathPrefix without requiring the Fresh editor runtime.
+ * Tests extractWordPrefix, extractPathPrefix, collectBufferWords,
+ * looksLikePath, normalizeSeparators, pathsEqual, and parsePathPrefix
+ * without requiring the Fresh editor runtime.
  *
- * Run with: npx tsx hippie_expand.test.ts
- * (or any TS runner that supports top-level execution)
+ * Run with: npx ts-node --esm hippie_expand.test.ts
  */
 
 // ---------------------------------------------------------------------------
@@ -13,6 +13,7 @@
 // ---------------------------------------------------------------------------
 
 const WORD_CHAR_PATTERN = /[A-Za-z0-9_\-]/;
+const PATH_CHAR_PATTERN = /[A-Za-z0-9_\-./\\~:]/;
 
 function wordTokenRegex(minLength: number): RegExp {
   return new RegExp(`[A-Za-z0-9_\\-]{${minLength},}`, "g");
@@ -24,6 +25,18 @@ function extractWordPrefix(
 ): { prefix: string; start: number } {
   let start = cursorPos;
   while (start > 0 && WORD_CHAR_PATTERN.test(bufferText[start - 1])) {
+    start--;
+  }
+  const prefix = bufferText.slice(start, cursorPos);
+  return { prefix, start };
+}
+
+function extractPathPrefix(
+  bufferText: string,
+  cursorPos: number,
+): { prefix: string; start: number } {
+  let start = cursorPos;
+  while (start > 0 && PATH_CHAR_PATTERN.test(bufferText[start - 1])) {
     start--;
   }
   const prefix = bufferText.slice(start, cursorPos);
@@ -69,6 +82,7 @@ function collectBufferWords(
     case "before": return beforeCursor;
     case "after":  return afterCursor;
     case "both":   return [...beforeCursor, ...afterCursor];
+    default:       return [];
   }
 }
 
@@ -101,6 +115,7 @@ function collectFirstWords(
     case "before": return before;
     case "after":  return after;
     case "both":   return [...before, ...after];
+    default:       return [];
   }
 }
 
@@ -108,7 +123,24 @@ function looksLikePath(prefix: string): boolean {
   if (prefix.length === 0) return false;
   if (prefix.includes("/") || prefix.includes("\\")) return true;
   const firstChar = prefix[0];
-  return firstChar === "." || firstChar === "~" || firstChar === "/";
+  if (firstChar === "." || firstChar === "~" || firstChar === "/") return true;
+  // Windows drive letter (e.g., "C:" or "C:\")
+  if (prefix.length >= 2 && /^[A-Za-z]:/.test(prefix)) return true;
+  return false;
+}
+
+function normalizeSeparators(path: string): string {
+  return path.replace(/\\/g, "/");
+}
+
+function pathsEqual(a: string, b: string): boolean {
+  const aNorm = normalizeSeparators(a);
+  const bNorm = normalizeSeparators(b);
+  const isWindows = /^[A-Za-z]:\//.test(aNorm) || /^[A-Za-z]:\//.test(bNorm);
+  if (isWindows) {
+    return aNorm.toLowerCase() === bNorm.toLowerCase();
+  }
+  return aNorm === bNorm;
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +223,70 @@ describe("extractWordPrefix", () => {
     { prefix: "b", start: 2 },
     "dot is NOT a word character — stops at dot",
   );
+
+  // Path separators are NOT word characters
+  const fwdPath = "./src/foo";
+  assertDeepEqual(
+    extractWordPrefix(fwdPath, fwdPath.length),
+    { prefix: "foo", start: fwdPath.length - 3 },
+    "word prefix stops at / — only captures 'foo'",
+  );
+
+  const winPath = "C:\\Users\\sam";
+  assertDeepEqual(
+    extractWordPrefix(winPath, winPath.length),
+    { prefix: "sam", start: winPath.length - 3 },
+    "word prefix stops at backslash",
+  );
+});
+
+describe("extractPathPrefix", () => {
+  // Path prefix includes /, \, ., ~, :
+  assertDeepEqual(
+    extractPathPrefix("./src/foo", 9),
+    { prefix: "./src/foo", start: 0 },
+    "captures full relative path including ./ and slashes",
+  );
+
+  const winAbsPath = "C:\\Users\\sam";
+  assertDeepEqual(
+    extractPathPrefix(winAbsPath, winAbsPath.length),
+    { prefix: winAbsPath, start: 0 },
+    "captures Windows absolute path with drive letter and backslashes",
+  );
+
+  assertDeepEqual(
+    extractPathPrefix("~/docs/report.txt", 17),
+    { prefix: "~/docs/report.txt", start: 0 },
+    "captures tilde-prefixed path with dots in filename",
+  );
+
+  assertDeepEqual(
+    extractPathPrefix("/etc/nginx/conf.d", 17),
+    { prefix: "/etc/nginx/conf.d", start: 0 },
+    "captures absolute Linux path",
+  );
+
+  // Stops at whitespace — path prefix doesn't cross spaces
+  assertDeepEqual(
+    extractPathPrefix("import ./src/foo", 16),
+    { prefix: "./src/foo", start: 7 },
+    "stops at whitespace before path",
+  );
+
+  // Still works for plain words (superset of word chars)
+  assertDeepEqual(
+    extractPathPrefix("foobar", 6),
+    { prefix: "foobar", start: 0 },
+    "plain word is also a valid path prefix",
+  );
+
+  // Quoted path context — stops at quote
+  assertDeepEqual(
+    extractPathPrefix('"./src/lib"', 10),
+    { prefix: "./src/lib", start: 1 },
+    "stops at double-quote before path",
+  );
 });
 
 describe("collectBufferWords — basic matching", () => {
@@ -198,16 +294,12 @@ describe("collectBufferWords — basic matching", () => {
 
   assertDeepEqual(
     collectBufferWords(text, "fo", text.length, "both"),
-    // All words match "fo*" — ordered: nearest before cursor first
-    // foobar(0-6), foo(7-10), fob(11-14), food(15-19)
-    // All are before cursor (cursor at end=19), reversed: food, fob, foo, foobar
     ["food", "fob", "foo", "foobar"],
     "collects all fo* words, nearest first",
   );
 
   assertDeepEqual(
     collectBufferWords(text, "foo", text.length, "both"),
-    // foobar, food match "foo*"; fob does NOT; "foo" is exact prefix → excluded
     ["food", "foobar"],
     "foo* excludes fob and exact prefix 'foo'",
   );
@@ -220,20 +312,16 @@ describe("collectBufferWords — basic matching", () => {
 });
 
 describe("collectBufferWords — before/after cursor split", () => {
-  //                   0123456789012345678
   const text = "alpha beta alpha gamma";
 
   assertDeepEqual(
     collectBufferWords(text, "al", 10, "before"),
-    // "alpha" at pos 0-5 is before cursor=10 → ["alpha"] reversed → ["alpha"]
     ["alpha"],
     "before cursor only",
   );
 
   assertDeepEqual(
     collectBufferWords(text, "al", 10, "after"),
-    // "alpha" at pos 11-16 is after cursor=10 → but it's a duplicate → []
-    // Wait — dedup is global, so second alpha is skipped
     [],
     "after cursor — duplicate alpha is skipped",
   );
@@ -244,10 +332,6 @@ describe("collectBufferWords — case insensitivity", () => {
 
   assertDeepEqual(
     collectBufferWords(text, "foo", text.length, "both"),
-    // All three match "foo*" case-insensitively
-    // But "foobar", "FOOBAR", "fooBar" have same lowercase → only first seen kept
-    // Scanning L-to-R: Foobar(0-6) kept, FOOBAR(7-13) dup, fooBar(14-20) dup
-    // All before cursor, reversed: just ["Foobar"]
     ["Foobar"],
     "case-insensitive dedup preserves first occurrence",
   );
@@ -257,9 +341,6 @@ describe("collectBufferWords — empty prefix", () => {
   const text = "alpha beta gamma";
 
   const result = collectBufferWords(text, "", 5, "both");
-  // Before cursor (<=5): alpha(0-5) → before list reversed: [alpha]
-  // After cursor (>5): beta(6-10), gamma(11-16) → [beta, gamma]
-  // Combined: [alpha, beta, gamma]
   assertDeepEqual(
     result,
     ["alpha", "beta", "gamma"],
@@ -268,21 +349,16 @@ describe("collectBufferWords — empty prefix", () => {
 });
 
 describe("collectBufferWords — proximity ordering", () => {
-  //                   01234567890123456789012
   const text = "aaa abc abd abe abf";
-  // aaa(0-3), abc(4-7), abd(8-11), abe(12-15), abf(16-19)
 
   assertDeepEqual(
     collectBufferWords(text, "ab", 12, "before"),
-    // Before cursor(12): abc(4-7) end=7 <=12 ✓, abd(8-11) end=11 <=12 ✓
-    // reversed: [abd, abc]
     ["abd", "abc"],
     "before-cursor words ordered nearest first",
   );
 
   assertDeepEqual(
     collectBufferWords(text, "ab", 12, "after"),
-    // After cursor(12): abe(12-15) end=15 >12 ✓, abf(16-19) end=19 >12 ✓
     ["abe", "abf"],
     "after-cursor words in occurrence order",
   );
@@ -297,6 +373,56 @@ describe("looksLikePath", () => {
   assert(looksLikePath("foobar") === false, "foobar is not path-like");
   assert(looksLikePath("") === false, "empty string is not path-like");
   assert(looksLikePath(".hidden") === true, ".hidden starts with dot");
+  // Windows drive letters
+  assert(looksLikePath("C:") === true, "C: is path-like (Windows drive)");
+  assert(looksLikePath("C:\\Users") === true, "C:\\Users is path-like");
+  assert(looksLikePath("D:/data") === true, "D:/data is path-like");
+});
+
+describe("normalizeSeparators", () => {
+  assert(
+    normalizeSeparators("C:\\Users\\sam") === "C:/Users/sam",
+    "backslashes converted to forward slashes",
+  );
+  assert(
+    normalizeSeparators("/home/sam") === "/home/sam",
+    "forward slashes unchanged on Linux",
+  );
+  assert(
+    normalizeSeparators("./src\\lib/foo") === "./src/lib/foo",
+    "mixed separators normalized",
+  );
+});
+
+describe("pathsEqual — cross-platform comparison", () => {
+  // Windows: case-insensitive
+  assert(
+    pathsEqual("C:\\Users\\Sam", "C:/users/sam") === true,
+    "Windows paths compared case-insensitively with normalized separators",
+  );
+  assert(
+    pathsEqual("C:/Foo", "C:/foo") === true,
+    "Windows forward-slash paths case-insensitive",
+  );
+  // Linux: case-sensitive
+  assert(
+    pathsEqual("/home/Sam", "/home/sam") === false,
+    "Linux paths compared case-sensitively",
+  );
+  assert(
+    pathsEqual("/home/sam", "/home/sam") === true,
+    "Linux identical paths are equal",
+  );
+  // Edge: one Windows with mixed case
+  assert(
+    pathsEqual("C:/Users/Sam", "c:/users/sam") === true,
+    "Windows drive letter triggers case-insensitive compare",
+  );
+  // Edge: neither has drive letter — treated as Linux (case-sensitive)
+  assert(
+    pathsEqual("/Users/Sam", "/Users/sam") === false,
+    "no drive letter = case-sensitive (Linux/macOS)",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -328,42 +454,75 @@ describe("edge cases", () => {
     "prefix longer than any word yields nothing",
   );
 
-  // Verify hyphenated words are treated as single tokens
   assertDeepEqual(
     extractWordPrefix("my-variable-name = 42", 16),
     { prefix: "my-variable-name", start: 0 },
     "hyphenated word is a single token",
   );
 
-  // Verify that the prefix itself isn't returned when it exactly matches
   assertDeepEqual(
     collectBufferWords("test test test", "test", 14, "both"),
     [],
     "all identical words = all excluded (exact match of prefix)",
   );
+
+  // Path prefix on empty buffer
+  assertDeepEqual(
+    extractPathPrefix("", 0),
+    { prefix: "", start: 0 },
+    "path prefix: empty buffer returns empty",
+  );
+
+  // Path prefix stops at parentheses, brackets, etc.
+  assertDeepEqual(
+    extractPathPrefix("require(./src/foo)", 17),
+    { prefix: "./src/foo", start: 8 },
+    "path prefix stops at opening paren",
+  );
+});
+
+describe("path prefix vs word prefix interaction", () => {
+  // The critical scenario: user types "./src/foo"
+  // Word prefix only sees "foo" (stops at /)
+  // Path prefix sees "./src/foo" (includes / and .)
+  const text = 'const p = "./src/foo';
+  const cursor = text.length; // at end
+
+  const wordResult = extractWordPrefix(text, cursor);
+  assert(
+    wordResult.prefix === "foo",
+    "word prefix extracts only 'foo' from path context",
+  );
+
+  const pathResult = extractPathPrefix(text, cursor);
+  assert(
+    pathResult.prefix === "./src/foo",
+    "path prefix extracts full './src/foo' from path context",
+  );
+
+  assert(
+    looksLikePath(pathResult.prefix) === true,
+    "path prefix triggers path completion",
+  );
+  assert(
+    looksLikePath(wordResult.prefix) === false,
+    "word prefix does NOT trigger path completion — this was the original bug",
+  );
 });
 
 describe("wrap-around scenario simulation", () => {
-  // Simulate: prefix "fo", candidates ["foobar", "fob"]
-  // index -1 = original prefix, 0 = foobar, 1 = fob
-  // next from 1 should wrap to -1 (original)
-  // next from -1 should go to 0
   const candidates = ["foobar", "fob"];
   let index = -1;
 
-  // First expand
   index = 0;
   assert(candidates[index] === "foobar", "first expansion is foobar");
 
-  // Next
   index = 1;
   assert(candidates[index] === "fob", "second expansion is fob");
 
-  // Next — would wrap
   const nextIndex = index + 1;
   assert(nextIndex >= candidates.length, "next index exceeds list — triggers wrap");
 
-  // Wrap back
   index = -1;
   assert(index === -1, "wrapped back to original prefix");
 });
