@@ -772,13 +772,29 @@ function rebuildUserPath(inputDir: string, name: string): string {
  * Sets suppressCursorCheck to avoid the cursor_moved handler exiting
  * cycling mode during our own programmatic edits.
  *
+ * Before editing, verifies the cursor and buffer content are where we
+ * expect. If they've drifted (e.g., due to an external edit or a race
+ * condition), we bail out by exiting cycling mode instead of corrupting
+ * the buffer.
+ *
  * If any editor mutation fails, we exit cycling mode to avoid state corruption.
  */
 function applyExpansion(candidate: string): void {
   suppressCursorCheck = true;
   try {
     const bufferId = editor.getActiveBufferId();
-    const deleteEnd = state.prefixStart + editor.utf8ByteLength(state.lastInserted);
+    const lastLen = editor.utf8ByteLength(state.lastInserted);
+    const deleteEnd = state.prefixStart + lastLen;
+
+    // Safety: verify cursor is at the expected position.
+    // If the user or another plugin moved the cursor, our edit region
+    // would be wrong and could corrupt the buffer ("jump back a word").
+    const cursorPos = editor.getCursorPosition();
+    if (cursorPos !== deleteEnd) {
+      // Cursor drifted — commit what's there and exit gracefully
+      exitCyclingMode();
+      return;
+    }
 
     editor.deleteRange(bufferId, state.prefixStart, deleteEnd);
     editor.insertText(bufferId, state.prefixStart, candidate);

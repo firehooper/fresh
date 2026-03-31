@@ -937,6 +937,38 @@ describe("collectContextualCandidates — dot chain matching", () => {
   );
 });
 
+describe("collectBufferWords — space-separated word completion", () => {
+  // User scenario: buffer has "testing" earlier, user types "foo te"
+  // Expansion should find "testing" and only replace "te" → "foo testing"
+  const text = "testing something foo te";
+  const cursor = text.length; // 24
+
+  assertDeepEqual(
+    collectBufferWords(text, "te", cursor, "both"),
+    ["testing"],
+    "'foo te' at end of buffer: finds 'testing' from earlier, only 'te' is the prefix",
+  );
+
+  // With "testing" after cursor instead
+  const text2 = "foo te other testing";
+  // "te" at pos 4-6, "testing" at pos 13-20
+  assertDeepEqual(
+    collectBufferWords(text2, "te", 6, "both"),
+    ["testing"],
+    "'foo te' with 'testing' after cursor: finds it correctly",
+  );
+
+  // Multiple te* words available
+  const text3 = "template foo testing bar te";
+  const cursor3 = text3.length; // cursor at end
+  // template at 0-8 (dist 18), testing at 12-19 (dist 7)
+  assertDeepEqual(
+    collectBufferWords(text3, "te", cursor3, "both"),
+    ["testing", "template"],
+    "finds both 'testing' and 'template', nearest first",
+  );
+});
+
 describe("getChainContextCascade", () => {
   assertDeepEqual(
     getChainContextCascade("foo.bar.baz."),
