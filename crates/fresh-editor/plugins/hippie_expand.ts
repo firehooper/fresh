@@ -8,10 +8,17 @@
  * to autocomplete the word-prefix at the cursor.
  *
  * Sources (tried in priority order):
- *   1. Current buffer — words before cursor (nearest first)
- *   2. Current buffer — words after cursor
- *   3. Other open (non-virtual) buffers
- *   4. File paths — when prefix looks path-like
+ *   0. Chain-context matches — when cursor is at "foo.bar.tes|", finds
+ *      "foo.bar.testing" elsewhere and prioritizes "testing"
+ *   1. Current buffer — words sorted by absolute proximity to cursor
+ *      (closest word first, whether before or after the cursor)
+ *   2. Other open (non-virtual) buffers
+ *   3. File paths — when prefix looks path-like
+ *
+ * Matching is case-insensitive on the prefix side, but completions
+ * preserve the original casing of the matched word in the buffer.
+ * When the same word appears multiple times with different casing,
+ * the occurrence nearest to the cursor wins.
  *
  * Keybinding: user must bind Alt+/ to "hippie_expand_next" in config.
  * Once cycling begins, the plugin enters "hippie-cycling" mode which
@@ -159,11 +166,39 @@ function extractPathPrefix(
 // §6.2  Candidate Collection — Buffer Words
 // ---------------------------------------------------------------------------
 
+/** A word match with its distance from the cursor for proximity sorting. */
+interface WordMatch {
+  word: string;
+  distance: number;
+  /** "before" = word ends at or before cursor; "after" = word starts at or after cursor. */
+  position: "before" | "after";
+}
+
+/**
+ * Compare two WordMatch entries by proximity.
+ * Primary: closest distance first.
+ * Tiebreaker: prefer "before" over "after" — you're more likely to want
+ * to reuse a word you recently typed above the cursor.
+ */
+function compareByProximity(a: WordMatch, b: WordMatch): number {
+  if (a.distance !== b.distance) {
+    return a.distance - b.distance;
+  }
+  // Tiebreak: before-cursor wins (0 < 1)
+  const aOrder = a.position === "before" ? 0 : 1;
+  const bOrder = b.position === "before" ? 0 : 1;
+  return aOrder - bOrder;
+}
+
 /**
  * Extract unique words from `text` that match `prefix` (case-insensitive).
- * Returns them ordered by proximity to `cursorPos`:
- *   - Words before cursor: nearest first (reversed occurrence order)
- *   - Words after cursor: nearest first (occurrence order)
+ * Returns them ordered by absolute proximity to `cursorPos` — the closest
+ * word wins regardless of whether it appears before or after the cursor.
+ *
+ * Deduplication is case-insensitive, but the **nearest** occurrence's
+ * casing is preserved. For example, if "FooBar" is far and "fooBar" is
+ * near the cursor, "fooBar" is the one returned.
+ *
  * The exact `prefix` itself is excluded from results.
  */
 function collectBufferWords(
@@ -178,10 +213,11 @@ function collectBufferWords(
 
   const regex = wordTokenRegex(prefix.length);
   const prefixLower = prefix.toLowerCase();
-  const beforeCursor: string[] = [];
-  const afterCursor: string[] = [];
-  const seen = new Set<string>(); // lowercase dedup key
+  const matchesByKey = new Map<string, WordMatch>();
   let match: RegExpExecArray | null;
+
+  // prefixStart = cursorPos - prefix.length (for overlap detection)
+  const prefixStart = cursorPos - prefix.length;
 
   while ((match = regex.exec(text)) !== null) {
     const word = match[0];
@@ -197,34 +233,60 @@ function collectBufferWords(
       continue;
     }
 
-    // Deduplicate (case-insensitive key, but preserve original case)
-    if (seen.has(wordLower)) {
+    // Skip the word the cursor is currently inside of.
+    // A match that starts at or before prefixStart and ends past cursorPos
+    // is the very word being typed — offering it back is not useful.
+    const wordEnd = match.index + word.length;
+    if (match.index <= prefixStart && wordEnd > cursorPos) {
       continue;
     }
-    seen.add(wordLower);
 
-    const wordEnd = match.index + word.length;
+    let distance: number;
+    let position: "before" | "after";
+
     if (wordEnd <= cursorPos) {
-      beforeCursor.push(word);
+      distance = cursorPos - wordEnd;
+      position = "before";
     } else {
-      afterCursor.push(word);
+      distance = match.index >= cursorPos ? match.index - cursorPos : 0;
+      position = "after";
+    }
+
+    // Deduplicate: keep the occurrence nearest to cursor (preserves its casing)
+    const existing = matchesByKey.get(wordLower);
+    if (!existing || distance < existing.distance) {
+      matchesByKey.set(wordLower, { word, distance, position });
     }
   }
 
-  // Before-cursor: nearest to cursor first → reverse
-  beforeCursor.reverse();
+  const allMatches = Array.from(matchesByKey.values());
 
   switch (order) {
-    case "before": return beforeCursor;
-    case "after":  return afterCursor;
-    case "both":   return [...beforeCursor, ...afterCursor];
-    default:       return [];
+    case "before":
+      return allMatches
+        .filter((m) => m.position === "before")
+        .sort(compareByProximity)
+        .map((m) => m.word);
+    case "after":
+      return allMatches
+        .filter((m) => m.position === "after")
+        .sort(compareByProximity)
+        .map((m) => m.word);
+    case "both":
+      return allMatches
+        .sort(compareByProximity)
+        .map((m) => m.word);
+    default:
+      return [];
   }
 }
 
 /**
  * When prefix is empty, return all distinct words near the cursor.
  * Useful for "expand first word" when cursor is at column 0 or after whitespace.
+ *
+ * Same proximity/dedup rules as collectBufferWords: sorted by absolute
+ * distance from cursor, nearest occurrence's casing wins.
  */
 function collectFirstWords(
   text: string,
@@ -232,34 +294,219 @@ function collectFirstWords(
   order: "before" | "after" | "both",
 ): string[] {
   const regex = wordTokenRegex(1);
-  const before: string[] = [];
-  const after: string[] = [];
-  const seen = new Set<string>();
+  const matchesByKey = new Map<string, WordMatch>();
   let match: RegExpExecArray | null;
 
   while ((match = regex.exec(text)) !== null) {
     const word = match[0];
     const key = word.toLowerCase();
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
 
-    if (match.index + word.length <= cursorPos) {
-      before.push(word);
+    const wordEnd = match.index + word.length;
+    let distance: number;
+    let position: "before" | "after";
+
+    if (wordEnd <= cursorPos) {
+      distance = cursorPos - wordEnd;
+      position = "before";
     } else {
-      after.push(word);
+      distance = match.index >= cursorPos ? match.index - cursorPos : 0;
+      position = "after";
+    }
+
+    const existing = matchesByKey.get(key);
+    if (!existing || distance < existing.distance) {
+      matchesByKey.set(key, { word, distance, position });
     }
   }
 
-  before.reverse();
+  const allMatches = Array.from(matchesByKey.values());
 
   switch (order) {
-    case "before": return before;
-    case "after":  return after;
-    case "both":   return [...before, ...after];
-    default:       return [];
+    case "before":
+      return allMatches
+        .filter((m) => m.position === "before")
+        .sort(compareByProximity)
+        .map((m) => m.word);
+    case "after":
+      return allMatches
+        .filter((m) => m.position === "after")
+        .sort(compareByProximity)
+        .map((m) => m.word);
+    case "both":
+      return allMatches
+        .sort(compareByProximity)
+        .map((m) => m.word);
+    default:
+      return [];
   }
+}
+
+// ---------------------------------------------------------------------------
+// §6.2b Candidate Collection — Chain Context (dot/equals chains)
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the dot/equals chain context immediately left of the prefix.
+ *
+ * For "foo.bar.baz.tes|", prefixStart points at "tes", so we walk left
+ * collecting word chars, dots, and equals signs. Returns "foo.bar.baz.".
+ *
+ * For "a.b = c.tes|", space stops the walk, so we get "c." — taking
+ * the closest chain to the left as the user expects.
+ *
+ * Returns "" if no chain separator (. or =) is found.
+ */
+function extractChainContext(
+  bufferText: string,
+  prefixStart: number,
+): string {
+  let start = prefixStart;
+  while (start > 0) {
+    const ch = bufferText[start - 1];
+    if (WORD_CHAR_PATTERN.test(ch) || ch === "." || ch === "=") {
+      start--;
+    } else {
+      break;
+    }
+  }
+  const chain = bufferText.slice(start, prefixStart);
+  // Only meaningful if it contains at least one separator
+  if (!chain.includes(".") && !chain.includes("=")) {
+    return "";
+  }
+  return chain;
+}
+
+/**
+ * Collect candidates that appear in the same chain context elsewhere in
+ * the buffer. For example, if the cursor is at "foo.bar.tes|" and the
+ * buffer contains "foo.bar.testing", returns ["testing"].
+ *
+ * Search is case-insensitive. Results are proximity-sorted.
+ * The occurrence at the cursor position itself is excluded.
+ */
+function collectContextualCandidates(
+  text: string,
+  chainContext: string,
+  prefix: string,
+  cursorPos: number,
+): string[] {
+  if (chainContext.length === 0) {
+    return [];
+  }
+
+  const chainLower = chainContext.toLowerCase();
+  const prefixLower = prefix.toLowerCase();
+  const textLower = text.toLowerCase();
+  const results = new Map<string, WordMatch>();
+
+  // The start of the typed chain in the buffer (to exclude the cursor occurrence)
+  const typedChainStart = cursorPos - prefix.length - chainContext.length;
+
+  let searchFrom = 0;
+  while (searchFrom < text.length) {
+    const idx = textLower.indexOf(chainLower, searchFrom);
+    if (idx === -1) {
+      break;
+    }
+
+    // Skip the occurrence at our cursor position
+    if (idx === typedChainStart) {
+      searchFrom = idx + 1;
+      continue;
+    }
+
+    // Extract the word that follows the chain context
+    const wordStart = idx + chainContext.length;
+    let wordEnd = wordStart;
+    while (wordEnd < text.length && WORD_CHAR_PATTERN.test(text[wordEnd])) {
+      wordEnd++;
+    }
+
+    const word = text.slice(wordStart, wordEnd);
+    if (word.length === 0) {
+      searchFrom = idx + 1;
+      continue;
+    }
+
+    const wordLower = word.toLowerCase();
+
+    // Skip exact prefix match
+    if (wordLower === prefixLower) {
+      searchFrom = idx + 1;
+      continue;
+    }
+
+    // Must match prefix if prefix is non-empty
+    if (prefix.length > 0 && !wordLower.startsWith(prefixLower)) {
+      searchFrom = idx + 1;
+      continue;
+    }
+
+    let distance: number;
+    let position: "before" | "after";
+    if (wordEnd <= cursorPos) {
+      distance = cursorPos - wordEnd;
+      position = "before";
+    } else {
+      distance = wordStart >= cursorPos ? wordStart - cursorPos : 0;
+      position = "after";
+    }
+
+    const existing = results.get(wordLower);
+    if (!existing || distance < existing.distance) {
+      results.set(wordLower, { word, distance, position });
+    }
+
+    searchFrom = idx + 1;
+  }
+
+  const allMatches = Array.from(results.values());
+  allMatches.sort(compareByProximity);
+  return allMatches.map((m) => m.word);
+}
+
+/**
+ * Generate progressively shorter chain context suffixes for cascaded matching.
+ *
+ * For "foo.bar.baz.", returns:
+ *   ["foo.bar.baz.", "bar.baz.", "baz."]
+ *
+ * This allows matching even when the full chain differs. For example,
+ * the buffer has `formatABA(aba).split("")` and user types `x.spl` — the
+ * full chain "x." won't match "formatABA(aba).", but the cascade also
+ * tries just "." which finds `.split` in any method chain.
+ *
+ * For "=" chains, no cascade (already minimal).
+ */
+function getChainContextCascade(fullChain: string): string[] {
+  if (fullChain.length === 0) {
+    return [];
+  }
+
+  const contexts: string[] = [fullChain];
+
+  // Only cascade dot-chains (not = or mixed)
+  if (!fullChain.includes(".")) {
+    return contexts;
+  }
+
+  // Generate shorter suffixes by removing leading "word." segments
+  let idx = 0;
+  while (idx < fullChain.length) {
+    const dotIdx = fullChain.indexOf(".", idx);
+    if (dotIdx === -1) {
+      break;
+    }
+    // Suffix starts at this dot, e.g., ".baz." from "foo.bar.baz."
+    const suffix = fullChain.slice(dotIdx);
+    if (suffix !== fullChain && suffix.length > 1) {
+      contexts.push(suffix);
+    }
+    idx = dotIdx + 1;
+  }
+
+  return contexts;
 }
 
 // ---------------------------------------------------------------------------
@@ -270,9 +517,12 @@ function collectFirstWords(
  * Collect candidates from all sources in priority order.
  * Stops early once MAX_CANDIDATES are found (perf guard for many open buffers).
  *
- * If the word prefix looks path-like (contains /, \, starts with . or ~),
- * we use extractPathPrefix for a wider capture and skip word sources.
- * Otherwise we collect word candidates from buffers normally.
+ * Priority order:
+ *   0. Chain-context matches — cascaded from most specific to least:
+ *      "foo.bar.baz." → "bar.baz." → "baz." → then just "."-based
+ *   1. Current buffer words (proximity-sorted)
+ *   2. Other open buffers
+ *   3. File paths (when prefix looks path-like)
  */
 async function collectAllCandidates(
   prefix: string,
@@ -304,7 +554,7 @@ async function collectAllCandidates(
   const isPathContext = looksLikePath(pathExtraction.prefix);
 
   if (isPathContext) {
-    // --- Source 4 first: File path completions ---
+    // --- Source 3 first: File path completions ---
     // Use the wider path-prefix (includes /, \, ., ~, :)
     const pathCandidates = collectPathCandidates(pathExtraction.prefix);
     appendUnique(pathCandidates);
@@ -317,12 +567,27 @@ async function collectAllCandidates(
     };
   }
 
-  // --- Source 1 & 2: Current buffer (before then after cursor) ---
-  const beforeWords = collectBufferWords(bufferText, prefix, cursorPos, "before");
-  appendUnique(beforeWords);
+  // --- Source 0: Chain-context matches (highest priority, cascaded) ---
+  // Try the full chain first ("foo.bar.baz."), then shorter suffixes
+  // ("bar.baz.", "baz.", ".") to find method/property patterns from
+  // other chains in the buffer (e.g., .split from formatABA(aba).split).
+  const chainContext = extractChainContext(bufferText, prefixStart);
+  if (chainContext.length > 0) {
+    const cascade = getChainContextCascade(chainContext);
+    for (const ctx of cascade) {
+      if (allCandidates.length >= MAX_CANDIDATES) {
+        break;
+      }
+      const contextual = collectContextualCandidates(
+        bufferText, ctx, prefix, cursorPos,
+      );
+      appendUnique(contextual);
+    }
+  }
 
-  const afterWords = collectBufferWords(bufferText, prefix, cursorPos, "after");
-  appendUnique(afterWords);
+  // --- Source 1: Current buffer words (interleaved by proximity) ---
+  const currentWords = collectBufferWords(bufferText, prefix, cursorPos, "both");
+  appendUnique(currentWords);
 
   // --- Source 3: Other open (non-virtual) buffers ---
   if (allCandidates.length < MAX_CANDIDATES) {
@@ -377,7 +642,10 @@ async function readBufferCapped(bufferId: number): Promise<string | null> {
 
 /**
  * Heuristic: does this prefix look like a filesystem path?
- * Triggers when it contains a separator, or starts with ., ~, or /.
+ * Triggers when it contains a separator, starts with ~, or has a drive letter.
+ *
+ * Dot-prefix is only path-like when followed by / or \ (e.g., ./src, ../foo)
+ * or is just "." or "..".  ".split" or ".sp" are method calls, not paths.
  */
 function looksLikePath(prefix: string): boolean {
   if (prefix.length === 0) {
@@ -387,10 +655,24 @@ function looksLikePath(prefix: string): boolean {
   if (prefix.includes("/") || prefix.includes("\\")) {
     return true;
   }
-  // Starts with path-like char
-  const firstChar = prefix[0];
-  if (firstChar === "." || firstChar === "~" || firstChar === "/") {
+  // Tilde: home directory shorthand (~/docs)
+  if (prefix[0] === "~") {
     return true;
+  }
+  // Dot-prefix: only path-like if followed by / or \ (like ./src, ..\foo)
+  // or is just "." or ".." (current/parent dir).
+  // NOT ".split", ".sp", ".hidden-method" — those are method/property calls.
+  if (prefix[0] === ".") {
+    if (prefix.length === 1) {
+      return true; // just "."
+    }
+    if (prefix[1] === "/" || prefix[1] === "\\") {
+      return true; // ./src, .\src
+    }
+    if (prefix[1] === ".") {
+      return true; // ../foo, ..
+    }
+    return false; // .split, .sp — method calls
   }
   // Windows drive letter (e.g., "C:" or "C:\")
   if (prefix.length >= 2 && /^[A-Za-z]:/.test(prefix)) {
@@ -539,7 +821,7 @@ function exitCyclingMode(): void {
   }
 }
 
-/** Show cycling status in the status bar. */
+/** Show cycling status in the status bar, including the matched prefix for context. */
 function showCyclingStatus(): void {
   if (state.index < 0) {
     editor.setStatus(editor.t("status.no_more"));
@@ -553,6 +835,7 @@ function showCyclingStatus(): void {
       index: String(state.index + 1),
       total: String(total),
       word: word,
+      prefix: state.prefix,
     }),
   );
 }
